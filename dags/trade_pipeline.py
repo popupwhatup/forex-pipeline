@@ -17,11 +17,23 @@ def get_postgres_connection():
         password=os.getenv("POSTGRES_PASSWORD"),
     )
 
+def get_run_date():
+    context = get_current_context()
+
+    dt = context.get("data_interval_start")
+
+    if dt is None:
+        dag_run = context.get("dag_run")
+        dt = context.get("logical_date") or dag_run.run_after
+    
+    return dt.date()
+
+
 @dag(
     dag_id="trade_pipeline",
     schedule="@daily",
-    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
-    catchup=False,
+    start_date=pendulum.datetime(2026, 6, 20, tz="UTC"),
+    catchup=True,
 )
 
 def trade_pipeline():
@@ -65,10 +77,7 @@ def trade_pipeline():
     #2
     @task
     def generate_trades():
-        context = get_current_context()
-        data_interval_start = context["data_interval_start"]
-
-        trade_date = data_interval_start.date()
+        trade_date = get_run_date()
         trade_date_str = trade_date.isoformat()
 
         # deterministic seed : วันเดิม = seed เดิม = trade ชุดเดิม
@@ -99,10 +108,8 @@ def trade_pipeline():
     #3
     @task.branch
     def check_market_day():
-        context = get_current_context()
-        data_interval_start = context["data_interval_start"]
-
-        weekday = data_interval_start.weekday()
+        trade_date = get_run_date()
+        weekday = trade_date.weekday()
 
         #Python weekday(): Monday = 0, Sunday = 6
         if weekday >= 5:
@@ -113,7 +120,7 @@ def trade_pipeline():
     @task
     def load_to_postgres(trades):
         if not trades:
-            raise AirflowSkipException
+            raise AirflowSkipException("No trades to load.")
         
         conn = None
         cursor = None
@@ -164,15 +171,13 @@ def trade_pipeline():
     #6
     @task
     def daily_summary():
-        context = get_current_context()
-        data_interval_start = context["data_interval_start"]
-        summary_date = data_interval_start.date().isoformat()
+        summary_date = get_run_date().isoformat()
 
         conn = None
         cursor = None
 
         try:
-            conn = get_postgres_connection
+            conn = get_postgres_connection()
             cursor = conn.cursor()
 
             cursor.execute("""
@@ -187,7 +192,7 @@ def trade_pipeline():
             """, (summary_date,))
 
             row = cursor.fetchone()
-            if row in None:
+            if row is None:
                 raise AirflowSkipException(f"No trades found for {summary_date}.")
             
             trade_date, total_profit, trade_count, win_count = row
@@ -233,7 +238,16 @@ def trade_pipeline():
     
     #7
     @task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
-    def notify(summary):
+    def notify():
+        context = get_current_context()
+        ti = context["ti"]
+
+        summary = ti.xcom_pull(task_ids="daily_summary")
+
+        if not summary:
+            raise AirflowSkipException("No summary to notify.")
+
+
         print("===== DAILY TRADING SUMMARY =====")
         print(f"Date: {summary['summary_date']}")
         print(f"Total profit: {summary['total_profit']}")
@@ -255,12 +269,12 @@ def trade_pipeline():
         task_id="latest_only",
     )
 
-    notified = notify(summary)
+    notified = notify()
 
     create_tables >> trades >> branch
 
     branch >> loaded >> summary >> latest_only >> notified
-    branch >> closed >> notified
+    branch >> closed
 
 
 trade_pipeline()
